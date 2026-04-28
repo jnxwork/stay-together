@@ -5184,8 +5184,8 @@ let catDragPhase = "none";  // "none" | "approach" | "dragging"
 let catDragX = 0, catDragY = 0;  // cat position during approach phase
 let catDragTargetX = 0, catDragTargetY = 0;  // approach target (leading position)
 const IDLE_MS = 30000;          // post-focus auto-walk delay
-const DAYDREAM_MS = 5 * 1000;    // 5s (TEST; prod: 5 * 60 * 1000)
-const IDLE_LEAVE_MS = 10 * 1000; // 10s (TEST; prod: 30 * 60 * 1000)
+const DAYDREAM_MS = 30 * 60 * 1000;   // 30min
+const IDLE_LEAVE_MS = 30 * 60 * 1000; // 30min
 
 // Find portal center from current room collision data
 function findPortalInCurrentRoom() {
