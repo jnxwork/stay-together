@@ -221,6 +221,7 @@ export default {
   monthOct: "October", monthNov: "November", monthDec: "December",
   updateReady: "New version available.",
   updateBtn: "Update",
+  catSummonedYou: "\u{1F431} You drifted off for 30 minutes... The cat has summoned you to the Lounge.",
   notOnline: "Not online",
   agoJustNow: "Online just now",
   agoMin: "Online {n}min ago",

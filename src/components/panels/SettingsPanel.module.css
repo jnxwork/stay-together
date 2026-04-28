@@ -213,11 +213,10 @@
 .namesToggles {
   display: flex;
   gap: var(--size-px-3);
-  flex-wrap: wrap;
 }
-/* Override PixelCheckbox internal gap (10px) → 8px */
+/* Override PixelCheckbox internal gap → tighter so items fit in one line */
 .namesToggles [role="checkbox"] {
-  gap: var(--size-px-2) !important;
+  gap: var(--size-px-1) !important;
 }
 
 /* PixelSelect: wide enough to show full option text */

@@ -220,6 +220,7 @@ export default {
   monthOct: "十月", monthNov: "十一月", monthDec: "十二月",
   updateReady: "新版本已就绪",
   updateBtn: "更新",
+  catSummonedYou: "\u{1F431} 你神游了30分钟…猫咪把你叼到了休闲区。",
   notOnline: "未在线",
   agoJustNow: "刚刚在线",
   agoMin: "{n}分钟前在线",

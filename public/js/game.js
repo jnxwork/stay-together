@@ -2402,7 +2402,7 @@ function standUp() {
 
 function emitPlayerSit(sitting) {
   if (!localPlayer) return;
-  socket.emit("playerSit", { sitting, x: localPlayer.x, y: localPlayer.y });
+  socket.emit("playerSit", { sitting, x: localPlayer.x, y: localPlayer.y, direction: localPlayer.direction });
   if (sitting) {
     const x = Math.round(localPlayer.x);
     const y = Math.round(localPlayer.y);
@@ -3234,9 +3234,9 @@ function drawPlayerLabel(player) {
     const emojiStr = STATUS_EMOJI[player.focusCategory] || STATUS_EMOJI[status] || "";
     const ew = ctx.measureText(emojiStr).width;
     ctx.fillText(emojiStr, s.x - ew / 2, emojiY);
-  } else if (player.id === myId && autoWalking) {
+  } else if (player.id === myId && (autoWalking || catDragPhase === "approach")) {
     ctx.fillStyle = "#fff";
-    const walkStr = t("grabCoffee");
+    const walkStr = catDragPhase !== "none" ? "\u{1F431}..." : t("grabCoffee");
     const ew = ctx.measureText(walkStr).width;
     ctx.fillText(walkStr, s.x - ew / 2, emojiY);
   } else if (player.id === myId && emojiSuppressUntil && Date.now() < emojiSuppressUntil) {
@@ -3749,7 +3749,82 @@ let catPrevAnimName = "";       // previous resolved animation name
 const CAT_SIT_FRAME_MS = 150;  // ms per frame for sit/stand transition
 
 function drawCatBody() {
-  if (catData.room !== currentRoom) return;
+  // --- Cat-dragging override: approach + dragging phases ---
+  const isDragMode = catDragPhase !== "none" && localPlayer;
+  if (!isDragMode && catData.room !== currentRoom) return;
+
+  if (isDragMode) {
+    let cx, cy;
+    if (catDragPhase === "approach") {
+      // Cat walks from its position toward leading position (18px ahead of player)
+      cx = catDragX;
+      cy = catDragY;
+      const adx = catDragTargetX - cx;
+      const ady = catDragTargetY - cy;
+      if (Math.abs(adx) >= Math.abs(ady)) {
+        catDirection = adx > 0 ? "right" : "left";
+      } else {
+        catDirection = ady > 0 ? "down" : "up";
+      }
+    } else {
+      // dragging: 18px ahead of player in their walking direction
+      const dir = localPlayer.direction;
+      const offsetX = dir === "left" ? -18 : dir === "right" ? 18 : 0;
+      const offsetY = dir === "up" ? -18 : dir === "down" ? 18 : 0;
+      cx = localPlayer.x + offsetX;
+      cy = localPlayer.y + offsetY;
+      catDirection = dir;
+    }
+
+    catAnimFrame += 0.02;
+    const now = Date.now();
+    if (now - catSpriteLastTime >= CAT_SPRITE_MOVE_MS) {
+      catSpriteFrame++;
+      catSpriteLastTime = now;
+    }
+
+    // Force walk animation
+    const walkAnim = CAT_SPRITE.anims.walk;
+    const totalFrames = walkAnim.frames;
+    const drawFrameIdx = catSpriteFrame % totalFrames;
+
+    // Shadow
+    ctx.fillStyle = "rgba(0,0,0,0.1)";
+    ctx.beginPath();
+    ctx.ellipse(cx, cy + 2, 8, 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Draw cat sprite
+    const sheet = spriteImages["cat_orange3"];
+    if (sheet && sheet._loaded) {
+      const dirRow = CAT_SPRITE.dirs[catDirection] || CAT_SPRITE.dirs.down;
+      const sx = (walkAnim.startCol + drawFrameIdx) * CAT_SPRITE.frameW;
+      const sy = dirRow * CAT_SPRITE.frameH;
+      const prevSmoothing = ctx.imageSmoothingEnabled;
+      ctx.imageSmoothingEnabled = false;
+      const drawX = cx - CAT_SPRITE.frameW / 2;
+      const drawY = cy + 8 - CAT_SPRITE.frameH;
+      const srcY = sy + CAT_SPRITE_TOP_CROP;
+      const srcH = CAT_SPRITE.frameH - CAT_SPRITE_TOP_CROP;
+      const dstY = drawY + CAT_SPRITE_TOP_CROP;
+      const dstH = CAT_SPRITE.frameH - CAT_SPRITE_TOP_CROP;
+      if (catDirection === "right") {
+        ctx.save();
+        ctx.translate(cx, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(sheet, sx, srcY, CAT_SPRITE.frameW, srcH, -CAT_SPRITE.frameW / 2, dstY, CAT_SPRITE.frameW, dstH);
+        ctx.restore();
+      } else {
+        ctx.drawImage(sheet, sx, srcY, CAT_SPRITE.frameW, srcH, drawX, dstY, CAT_SPRITE.frameW, dstH);
+      }
+      ctx.imageSmoothingEnabled = prevSmoothing;
+    }
+
+    // Reset sit state machine so normal rendering resumes cleanly after drag
+    catSitPhase = "none";
+    catPrevAnimName = "";
+    return;
+  }
 
   const { x, y, state } = catData;
   catAnimFrame += 0.02; // Keep incrementing for UI effects (Zzz float, etc.)
@@ -4371,6 +4446,7 @@ function drawCatBody_procedural() {
 
 // Cat UI elements (drawn at full resolution)
 function drawCatUI() {
+  if (catDragPhase !== "none") return;
   if (catData.room !== currentRoom) return;
   const { x, y, state } = catData;
 
@@ -5104,9 +5180,12 @@ let hasCheckedIn = false;
 let autoWalking = false;
 let autoWalkPath = [];    // waypoint queue [{x,y}, ...]
 let awStuckFrames = 0;
+let catDragPhase = "none";  // "none" | "approach" | "dragging"
+let catDragX = 0, catDragY = 0;  // cat position during approach phase
+let catDragTargetX = 0, catDragTargetY = 0;  // approach target (leading position)
 const IDLE_MS = 30000;          // post-focus auto-walk delay
-const DAYDREAM_MS = 5 * 60 * 1000;    // 5min
-const IDLE_LEAVE_MS = 10 * 60 * 1000; // 10min
+const DAYDREAM_MS = 5 * 1000;    // 5s (TEST; prod: 5 * 60 * 1000)
+const IDLE_LEAVE_MS = 10 * 1000; // 10s (TEST; prod: 30 * 60 * 1000)
 
 // Find portal center from current room collision data
 function findPortalInCurrentRoom() {
@@ -5171,9 +5250,10 @@ document.addEventListener("keydown", (e) => {
   // Hide move hint only on actual movement keys
   const hintKeys = ["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","w","W","a","A","s","S","d","D"];
   if (hintKeys.includes(e.key)) { hideMoveHint(); storeSet("game", "setPlayerHasMoved"); }
-  if (autoWalking) {
+  if (autoWalking || catDragPhase !== "none") {
     autoWalking = false;
     autoWalkPath = [];
+    catDragPhase = "none";
     postFocusTime = 0;
     document.getElementById("autowalk-hint").style.display = "none";
   }
@@ -6367,6 +6447,7 @@ function startFocus(category, taskName) {
   miniFocusTaskDraft = taskName || miniFocusTaskDraft;
   lastKeyPressTime = Date.now();
   autoWalking = false;
+  catDragPhase = "none";
   postFocusTime = 0;
   emojiSuppressUntil = 0;
 
@@ -6395,6 +6476,7 @@ function endFocus() {
   focusCategory = null;
   focusTaskName = "";
   autoWalking = false;
+  catDragPhase = "none";
   lastKeyPressTime = Date.now();
   postFocusTime = Date.now(); // Start post-focus state
   emojiSuppressUntil = Date.now() + 30000; // Suppress emoji during post-focus
@@ -7036,11 +7118,16 @@ socket.on("sessionRestored", (data) => {
       updateFocusUI();
     }
 
+    // Sync lastSent so game loop doesn't emit a spurious playerMove
+    lastSentX = localPlayer.x;
+    lastSentY = localPlayer.y;
+
     // Suppress welcome popup and entrance walk
     hasCheckedIn = true;
     document.getElementById("welcome-popup").classList.add("hidden");
     storeSet("ui", "setWelcomeOpen", false);
     autoWalking = false;
+    catDragPhase = "none";
     autoWalkPath = [];
     lastKeyPressTime = Date.now();
   } else {
@@ -7140,6 +7227,7 @@ socket.on("playerUpdated", (player) => {
     otherPlayers[player.id].focusStartTime = player.focusStartTime;
     otherPlayers[player.id].focusCategory = player.focusCategory;
     otherPlayers[player.id].isSitting = player.isSitting;
+    if (player.direction) otherPlayers[player.id].direction = player.direction;
     otherPlayers[player.id].tagline = player.tagline;
     otherPlayers[player.id].languages = player.languages;
     otherPlayers[player.id].timezoneHour = player.timezoneHour;
@@ -7167,7 +7255,9 @@ socket.on("playerChangedRoom", (data) => {
     localPlayer.focusCategory = null;
     localPlayer.status = "resting";
 
+    const wasAutoWalk = autoWalking;
     autoWalking = false;
+    catDragPhase = "none";
     autoWalkPath = [];
     focusPortalPending = false;
     postFocusTime = 0; // Clear post-focus state on room change
@@ -7180,6 +7270,12 @@ socket.on("playerChangedRoom", (data) => {
     currentRoom = data.room;
     updateRoomUI();
     switchMusic();
+
+    if (wasAutoWalk && data.room === "rest") {
+      const msg = { type: "system", text: t("catSummonedYou"), time: Date.now() };
+      addChatMessage(msg);
+      storeSet("chat", "addMessage", msg);
+    }
   } else if (otherPlayers[data.id]) {
     otherPlayers[data.id].room = data.room;
     otherPlayers[data.id].x = data.x;
@@ -7868,14 +7964,28 @@ function update(dt) {
   updateCampfireSound();
   updateFrogSound();
 
-  // Wandering idle: 5min → daydreaming, 10min → auto-walk to Lounge
+  // Wandering idle: daydreaming after 5min
+  // NOTE: idle auto-walk to Lounge disabled for now (cat drag feature shelved)
   if (hasCheckedIn && !isFocusing && currentRoom === "focus" && !autoWalking) {
     const idleTime = Date.now() - lastKeyPressTime;
-    if (idleTime > IDLE_LEAVE_MS) {
-      startAutoWalk();
-    } else if (idleTime > DAYDREAM_MS && localPlayer.status !== "daydreaming") {
+    if (idleTime > DAYDREAM_MS && localPlayer.status !== "daydreaming") {
       localPlayer.status = "daydreaming";
       socket.emit("setStatus", "daydreaming");
+    }
+  }
+
+  // Cat approach phase: cat walks toward leading position (18px ahead of player toward portal)
+  if (catDragPhase === "approach" && localPlayer) {
+    const cdx = catDragTargetX - catDragX;
+    const cdy = catDragTargetY - catDragY;
+    const cdist = Math.sqrt(cdx * cdx + cdy * cdy);
+    if (cdist < 8) {
+      catDragPhase = "dragging";
+      startAutoWalk();
+    } else {
+      const cspd = 2.0 * dtScale;
+      catDragX += (cdx / cdist) * cspd;
+      catDragY += (cdy / cdist) * cspd;
     }
   }
 
@@ -7920,6 +8030,7 @@ function update(dt) {
     }
     if (autoWalkPath.length === 0) {
       autoWalking = false;
+      catDragPhase = "none";
     }
   }
 
@@ -7964,8 +8075,16 @@ function drawYSortedEntities() {
   // Collect all entities with their sort Y (feet/base position)
   const entities = _ysortEntities;
   entities.length = 0;
-  if (catData.room === currentRoom) {
-    entities.push({ type: 0, sortY: catData.y });
+  if (catData.room === currentRoom || catDragPhase !== "none") {
+    let catSortY;
+    if (catDragPhase === "dragging" && localPlayer) {
+      catSortY = localPlayer.y + (localPlayer.direction === "up" ? -18 : localPlayer.direction === "down" ? 18 : 0);
+    } else if (catDragPhase === "approach") {
+      catSortY = catDragY;
+    } else {
+      catSortY = catData.y;
+    }
+    entities.push({ type: 0, sortY: catSortY });
   }
   for (const id in otherPlayers) {
     const p = otherPlayers[id];
@@ -8318,9 +8437,10 @@ if (isTouchDevice) {
     if (localSitting) standUp();
     // Reset idle timer
     lastKeyPressTime = Date.now();
-    if (autoWalking) {
+    if (autoWalking || catDragPhase !== "none") {
       autoWalking = false;
       autoWalkPath = [];
+      catDragPhase = "none";
       postFocusTime = 0;
       document.getElementById("autowalk-hint").style.display = "none";
     }

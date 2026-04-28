@@ -118,7 +118,16 @@ if (!userCols.includes("email")) {
       birth_month INTEGER DEFAULT NULL,
       profession  TEXT NOT NULL DEFAULT 'mystery',
       is_guest   INTEGER NOT NULL DEFAULT 0,
-      last_seen  INTEGER
+      last_seen  INTEGER,
+      last_x     REAL,
+      last_y     REAL,
+      last_room  TEXT,
+      last_status    TEXT,
+      last_direction TEXT,
+      last_sitting   INTEGER,
+      last_focusing  INTEGER,
+      last_focus_start INTEGER,
+      last_focus_category TEXT
     );
     CREATE TABLE auth_tokens (
       token      TEXT PRIMARY KEY,
@@ -158,6 +167,15 @@ try { db.exec("ALTER TABLE users ADD COLUMN birth_month INTEGER DEFAULT NULL"); 
 try { db.exec("ALTER TABLE users ADD COLUMN profession TEXT NOT NULL DEFAULT 'mystery'"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN is_guest INTEGER NOT NULL DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE users ADD COLUMN last_seen INTEGER"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_x REAL"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_y REAL"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_room TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_status TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_direction TEXT"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_sitting INTEGER"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_focusing INTEGER"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_focus_start INTEGER"); } catch {}
+try { db.exec("ALTER TABLE users ADD COLUMN last_focus_category TEXT"); } catch {}
 try { db.exec("ALTER TABLE bulletin_notes ADD COLUMN author_profession TEXT NOT NULL DEFAULT 'mystery'"); } catch {}
 
 const VALID_PROFESSIONS = ["tech", "creative", "business", "student", "educator", "freelance", "mystery"];
@@ -194,6 +212,9 @@ const stmtUpgradeGuest = db.prepare(
   "UPDATE users SET email=?, password=?, is_guest=0, name=?, character=?, tagline=?, languages=?, birth_month=?, profession=? WHERE id=? AND is_guest=1"
 );
 const stmtUpdateLastSeen = db.prepare("UPDATE users SET last_seen = unixepoch() WHERE id = ?");
+const stmtSaveRuntimeState = db.prepare(
+  `UPDATE users SET last_x=?, last_y=?, last_room=?, last_status=?, last_direction=?, last_sitting=?, last_focusing=?, last_focus_start=?, last_focus_category=?, last_seen=unixepoch() WHERE id=?`
+);
 const stmtCleanupGuests = db.prepare(
   "DELETE FROM users WHERE is_guest = 1 AND last_seen IS NOT NULL AND last_seen < unixepoch() - 30 * 86400"
 );
@@ -540,6 +561,23 @@ function updateSessionSnapshot(socketId) {
     sessions[token].playerSnapshot = { ...players[socketId], giftPile: [...players[socketId].giftPile], languages: [...(players[socketId].languages || [])] };
   }
 }
+
+function savePlayerState(p) {
+  if (!p || !p._userId) return;
+  try {
+    stmtSaveRuntimeState.run(p.x, p.y, p.room, p.status, p.direction, p.isSitting ? 1 : 0, p.isFocusing ? 1 : 0, p.focusStartTime || null, p.focusCategory || null, p._userId);
+  } catch (e) {
+    console.error("[STATE] save error:", e.message);
+  }
+}
+
+const saveAllPlayerStates = db.transaction(() => {
+  for (const p of Object.values(players)) {
+    if (p._userId) {
+      stmtSaveRuntimeState.run(p.x, p.y, p.room, p.status, p.direction, p.isSitting ? 1 : 0, p.isFocusing ? 1 : 0, p.focusStartTime || null, p.focusCategory || null, p._userId);
+    }
+  }
+});
 const chatHistory = [];
 const MAX_CHAT_HISTORY = 50;
 const TILE = 32;
@@ -1195,10 +1233,29 @@ function updateCat() {
         }
       } else {
         // Phase 3: arrived at portal, switch rooms
-        const spawn = getPortalSpawn(cat.pendingRoom);
         cat.room = cat.pendingRoom;
-        cat.x = spawn.x;
-        cat.y = spawn.y;
+        // Find a safe cat-walkable spawn in the main area (avoid narrow corridors)
+        const spawn = getPortalSpawn(cat.room);
+        let sx = spawn.x, sy = spawn.y;
+        const catMinY = cat.room === "rest" ? 10 * TILE + TILE / 2 : 0;
+        if (!isCatWalkable(sx, sy, cat.room) || sy < catMinY) {
+          const dims = ROOM_DIMS[cat.room];
+          const cx = Math.floor(dims.cols / 2) * TILE + TILE / 2;
+          const cy = Math.max(Math.floor(dims.rows / 2) * TILE + TILE / 2, catMinY);
+          let found = false;
+          for (let r = 0; r <= 128; r += 8) {
+            for (const [dx, dy] of [[0,0],[r,0],[-r,0],[0,r],[0,-r],[r,r],[-r,r],[r,-r],[-r,-r]]) {
+              const nx = cx + dx, ny = cy + dy;
+              if (ny >= catMinY && isCatWalkable(nx, ny, cat.room)) {
+                sx = nx; sy = ny;
+                found = true; break;
+              }
+            }
+            if (found) break;
+          }
+        }
+        cat.x = sx;
+        cat.y = sy;
         cat.pendingRoom = null;
         cat.walkingToPortal = false;
         cat.onFurniture = null;
@@ -1850,30 +1907,81 @@ io.on("connection", (socket) => {
   } else {
     // --- New connection ---
     const token = sessionToken || crypto.randomUUID();
-    const spawn = getInitialSpawn();
-    player = {
-      id: socket.id,
-      x: spawn.x,
-      y: spawn.y,
-      name: "Anonymous",
-      status: "wandering",
-      direction: "down",
-      room: "focus",
-      isFocusing: false,
-      focusStartTime: null,
-      focusCategory: null,
-      lastMoveTime: Date.now(),
-      giftPile: [],
-      idlePileCount: 0,
-      isSitting: false,
-      character: { preset: 1 },
-      connectedAt: Date.now(),
-      tagline: "",
-      languages: [],
-      timezoneHour: null,
-      birthMonth: null,
-      profession: "mystery",
-    };
+
+    // Try to restore position from DB (survives server restarts)
+    let restoredFromDB = false;
+    const RESTORE_MAX_AGE = 48 * 60 * 60; // 48h in seconds
+    if (dbUser.last_room && dbUser.last_x != null && dbUser.last_y != null && dbUser.last_seen != null) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (nowSec - dbUser.last_seen < RESTORE_MAX_AGE) {
+        const room = dbUser.last_room;
+        const x = dbUser.last_x;
+        const y = dbUser.last_y;
+        if (room === "focus" || room === "rest") {
+          let rx = x, ry = y;
+          let sitting = !!dbUser.last_sitting;
+          if (!isSpawnSafe(rx, ry, room)) {
+            // Position no longer walkable (map changed) — use portal spawn in same room
+            const fallback = getPortalSpawn(room);
+            rx = fallback.x;
+            ry = fallback.y;
+            sitting = false;
+          }
+          restoredFromDB = true;
+          player = {
+            id: socket.id,
+            x: rx, y: ry,
+            name: "Anonymous",
+            status: dbUser.last_status || "wandering",
+            direction: dbUser.last_direction || "down",
+            room,
+            isFocusing: !!dbUser.last_focusing,
+            focusStartTime: dbUser.last_focus_start || null,
+            focusCategory: dbUser.last_focus_category || null,
+            lastMoveTime: Date.now(),
+            giftPile: [],
+            idlePileCount: 0,
+            isSitting: sitting,
+            character: { preset: 1 },
+            connectedAt: Date.now(),
+            tagline: "",
+            languages: [],
+            timezoneHour: null,
+            birthMonth: null,
+            profession: "mystery",
+          };
+          isResume = true;
+          console.log(`Player restored from DB: ${socket.id} (room=${room}, x=${Math.round(rx)}, y=${Math.round(ry)}, focusing=${!!dbUser.last_focusing}, user=${dbUser.email})`);
+        }
+      }
+    }
+
+    if (!restoredFromDB) {
+      const spawn = getInitialSpawn();
+      player = {
+        id: socket.id,
+        x: spawn.x,
+        y: spawn.y,
+        name: "Anonymous",
+        status: "wandering",
+        direction: "down",
+        room: "focus",
+        isFocusing: false,
+        focusStartTime: null,
+        focusCategory: null,
+        lastMoveTime: Date.now(),
+        giftPile: [],
+        idlePileCount: 0,
+        isSitting: false,
+        character: { preset: 1 },
+        connectedAt: Date.now(),
+        tagline: "",
+        languages: [],
+        timezoneHour: null,
+        birthMonth: null,
+        profession: "mystery",
+      };
+    }
 
     // Load profile from DB (all users have a DB row — guest or registered)
     player.name = dbUser.name;
@@ -1957,7 +2065,7 @@ io.on("connection", (socket) => {
     socket.broadcast.emit("playerJoined", sanitizePlayer(players[socket.id]));
   } else {
     socket.broadcast.emit("playerJoined", sanitizePlayer(players[socket.id]));
-    onPlayerEnterRoom(socket.id, "focus");
+    onPlayerEnterRoom(socket.id, player.room);
   }
 
   // Pet the cat
@@ -2338,6 +2446,8 @@ io.on("connection", (socket) => {
     p.isSitting = !!data.sitting;
     if (Number.isFinite(data.x)) p.x = data.x;
     if (Number.isFinite(data.y)) p.y = data.y;
+    const validDirs = ["up", "down", "left", "right"];
+    if (validDirs.includes(data.direction)) p.direction = data.direction;
     if (p.isSitting) {
       const name = p.name || "player";
       const x = Math.round(p.x);
@@ -2460,11 +2570,11 @@ io.on("connection", (socket) => {
       }
     }
 
-    // Clean up userSocketMap + update last_seen
+    // Clean up userSocketMap + persist state to DB
     const p = players[socket.id];
     if (p && p._userId) {
       if (userSocketMap[p._userId] === socket.id) delete userSocketMap[p._userId];
-      stmtUpdateLastSeen.run(p._userId);
+      savePlayerState(p);
     }
 
     // Never-completed-welcome players (still "Anonymous") get no grace period
@@ -2552,6 +2662,12 @@ setInterval(() => {
   if (onlineUserIds.length > 0) {
     try { weeklyStatsCollect(weekStart, onlineUserIds, roomGroups); }
     catch (e) { console.error("[WEEKLY] stats collect error:", e.message); }
+  }
+
+  // Flush player runtime state to DB every 60s
+  if (Object.keys(players).length > 0) {
+    try { saveAllPlayerStates(); }
+    catch (e) { console.error("[STATE] periodic save error:", e.message); }
   }
 }, 60 * 1000);
 
@@ -2661,3 +2777,21 @@ const isDev = !fs.existsSync(distPath);
     console.log(`Server running at http://localhost:${PORT} [${APP_ENV}] (${isDev ? 'dev' : 'built'})`);
   });
 })();
+
+// Graceful shutdown — flush all player states before exit
+function gracefulShutdown(signal) {
+  const count = Object.keys(players).length;
+  if (count > 0) {
+    try { saveAllPlayerStates(); }
+    catch (e) { console.error("[SHUTDOWN] save error:", e.message); }
+  }
+  console.log(`[SHUTDOWN] Saved ${count} player states (${signal})`);
+  server.close(() => {
+    db.close();
+    process.exit(0);
+  });
+  // Force exit after 5s if server.close hangs
+  setTimeout(() => { db.close(); process.exit(1); }, 5000);
+}
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
