@@ -553,7 +553,7 @@ let lastOutdoorCheck = 0;
 // Session persistence: survive tab sleep / reconnect
 const sessions = {};          // sessionToken -> { playerId, disconnectTimer, playerSnapshot }
 const socketToSession = {};   // socket.id -> sessionToken
-const GRACE_PERIOD_MS = 4 * 60 * 60 * 1000; // 4h grace period — tabs can stay backgrounded for hours
+const GRACE_PERIOD_MS = 30 * 60 * 1000; // 30min grace period for backgrounded tabs
 
 function updateSessionSnapshot(socketId) {
   const token = socketToSession[socketId];
@@ -1148,19 +1148,34 @@ function pickFurnitureTarget() {
 }
 
 function updateCat() {
-  // Safety net: if cat is in a non-walkable tile, snap to nearest walkable spot
-  if (!isCatWalkable(cat.x, cat.y, cat.room)) {
-    for (let r = 8; r <= 64; r += 8) {
-      let found = false;
-      for (const [dx, dy] of [[r,0],[-r,0],[0,r],[0,-r],[r,r],[-r,r],[r,-r],[-r,-r]]) {
-        if (isCatWalkable(cat.x + dx, cat.y + dy, cat.room)) {
-          cat.x += dx;
-          cat.y += dy;
-          found = true;
-          break;
+  // Safety net: if cat is in a non-walkable tile OR stuck in narrow corridor, teleport to safe area
+  const catMinY = cat.room === "rest" ? 10 * TILE + TILE / 2 : 0;
+  const inRestrictedArea = cat.room === "rest" && !cat.walkingToPortal && cat.y < catMinY;
+  if (!isCatWalkable(cat.x, cat.y, cat.room) || inRestrictedArea) {
+    // Teleport to safe central position (don't search nearby — nearby tiles may still be in corridor)
+    const dims = ROOM_DIMS[cat.room];
+    const cx = Math.floor(dims.cols / 2) * TILE + TILE / 2;
+    const cy = Math.max(Math.floor(dims.rows / 2) * TILE + TILE / 2, catMinY);
+    let rescued = false;
+    for (let r = 0; r <= 128; r += 8) {
+      for (const [dx, dy] of [[0,0],[r,0],[-r,0],[0,r],[0,-r],[r,r],[-r,r],[r,-r],[-r,-r]]) {
+        const nx = cx + dx, ny = cy + dy;
+        if (ny >= catMinY && isCatWalkable(nx, ny, cat.room)) {
+          cat.x = nx; cat.y = ny;
+          rescued = true; break;
         }
       }
-      if (found) break;
+      if (rescued) break;
+    }
+    if (rescued) {
+      cat.targetX = cat.x; cat.targetY = cat.y;
+      cat._path = null;
+      cat.onFurniture = null;
+      // If stuck in corridor, reset movement state to prevent re-entering
+      if (inRestrictedArea) {
+        cat.state = "sit";
+        cat.stateTimer = 60 + Math.floor(Math.random() * 60);
+      }
     }
   }
 
@@ -1169,11 +1184,25 @@ function updateCat() {
 
   // Handle portal travel: delay → walk to portal → switch rooms
   if (cat.pendingRoom) {
+    // Portal walk timeout: if stuck walking for too long, abort
+    if (cat.walkingToPortal) {
+      cat._portalWalkTicks = (cat._portalWalkTicks || 0) + 1;
+      if (cat._portalWalkTicks > 600) { // ~30s timeout
+        cat.pendingRoom = null;
+        cat.walkingToPortal = false;
+        cat._portalPath = null;
+        cat._portalWalkTicks = 0;
+        cat.state = "sit";
+        cat.stateTimer = 60 + Math.floor(Math.random() * 60);
+        return;
+      }
+    }
     if (cat.portalDelay > 0) {
       // Phase 1: short pause before walking to portal
       cat.portalDelay--;
       if (cat.portalDelay <= 0) {
         cat.walkingToPortal = true;
+        cat._portalWalkTicks = 0;
         cat.state = "wander";
         cat.onFurniture = null;
         cat.gift = null;
@@ -1182,6 +1211,7 @@ function updateCat() {
     }
     if (!cat.walkingToPortal) {
       cat.walkingToPortal = true;
+      cat._portalWalkTicks = 0;
       cat.state = "wander";
       cat.onFurniture = null;
       cat.gift = null;
@@ -1258,6 +1288,7 @@ function updateCat() {
         cat.y = sy;
         cat.pendingRoom = null;
         cat.walkingToPortal = false;
+        cat._portalWalkTicks = 0;
         cat.onFurniture = null;
 
         if (cat.curioTarget && players[cat.curioTarget] &&
@@ -1878,6 +1909,14 @@ io.on("connection", (socket) => {
     player.id = socket.id;
     player.lastMoveTime = Date.now(); // reset so gift pile doesn't dump
 
+    // Clear stale focus sessions from snapshot (same 24h check as DB restore)
+    const MAX_FOCUS_AGE_MS = 24 * 60 * 60 * 1000;
+    if (player.isFocusing && player.focusStartTime && (Date.now() - player.focusStartTime > MAX_FOCUS_AGE_MS)) {
+      player.isFocusing = false;
+      player.focusStartTime = null;
+      player.focusCategory = null;
+    }
+
     // Overlay profile from DB (may have changed on another device)
     player.name = dbUser.name;
     player.character = safeJsonParse(dbUser.character, { preset: 1 });
@@ -1927,6 +1966,17 @@ io.on("connection", (socket) => {
             ry = fallback.y;
             sitting = false;
           }
+          // Clear stale focus sessions: if focus started more than 24h ago, it's invalid
+          const MAX_FOCUS_AGE_MS = 24 * 60 * 60 * 1000;
+          let restoreFocusing = !!dbUser.last_focusing;
+          let restoreFocusStart = dbUser.last_focus_start || null;
+          let restoreFocusCategory = dbUser.last_focus_category || null;
+          if (restoreFocusing && restoreFocusStart && (Date.now() - restoreFocusStart > MAX_FOCUS_AGE_MS)) {
+            restoreFocusing = false;
+            restoreFocusStart = null;
+            restoreFocusCategory = null;
+          }
+
           restoredFromDB = true;
           player = {
             id: socket.id,
@@ -1935,9 +1985,9 @@ io.on("connection", (socket) => {
             status: dbUser.last_status || "wandering",
             direction: dbUser.last_direction || "down",
             room,
-            isFocusing: !!dbUser.last_focusing,
-            focusStartTime: dbUser.last_focus_start || null,
-            focusCategory: dbUser.last_focus_category || null,
+            isFocusing: restoreFocusing,
+            focusStartTime: restoreFocusStart,
+            focusCategory: restoreFocusCategory,
             lastMoveTime: Date.now(),
             giftPile: [],
             idlePileCount: 0,
@@ -2410,12 +2460,21 @@ io.on("connection", (socket) => {
 
   socket.on("startFocus", (data) => {
     if (!players[socket.id]) return;
-    if (players[socket.id].isFocusing) return;
     if (players[socket.id].room !== "focus") return;
     if (typeof data !== "object" || !data) return;
 
     const validCategories = ["working", "studying", "reading", "writing", "creating", "exercising"];
     const category = validCategories.includes(data.category) ? data.category : "working";
+
+    // If already focusing (e.g. client re-sync after reconnect), keep existing startTime
+    if (players[socket.id].isFocusing) {
+      // Only update category if changed
+      if (players[socket.id].focusCategory !== category) {
+        players[socket.id].focusCategory = category;
+        io.emit("playerUpdated", sanitizePlayer(players[socket.id]));
+      }
+      return;
+    }
 
     players[socket.id].isFocusing = true;
     players[socket.id].focusStartTime = Date.now();
@@ -2582,6 +2641,13 @@ io.on("connection", (socket) => {
 
     if (intentionalClose || isGhost) {
       // Tab closed or ghost — immediate removal, no grace period
+      // Clear focus state in DB so it doesn't restore next login
+      if (p && p._userId && p.isFocusing) {
+        p.isFocusing = false;
+        p.focusStartTime = null;
+        p.focusCategory = null;
+        savePlayerState(p);
+      }
       delete players[socket.id];
       io.emit("playerLeft", socket.id);
       if (token) { delete sessions[token]; delete socketToSession[socket.id]; }
@@ -2593,6 +2659,13 @@ io.on("connection", (socket) => {
         console.log(`Session expired: ${token.slice(0, 8)}`);
         const sid = sessions[token].playerId;
         if (sid && players[sid]) {
+          // Clear focus state before removal so it doesn't restore next login
+          if (players[sid].isFocusing && players[sid]._userId) {
+            players[sid].isFocusing = false;
+            players[sid].focusStartTime = null;
+            players[sid].focusCategory = null;
+            savePlayerState(players[sid]);
+          }
           delete players[sid];
           io.emit("playerLeft", sid);
         }

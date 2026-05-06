@@ -7165,19 +7165,23 @@ document.addEventListener("visibilitychange", () => {
 });
 
 // Tab close: end focus (save record) + remove player immediately
+let _pageClosing = false;
 function handlePageClose(e) {
-  if (isFocusing) {
-    // Save focus record before leaving
-    const elapsed = Date.now() - focusStartTime;
-    saveFocusRecord(focusTaskName, focusCategory, elapsed, focusStartTime);
-    localStorage.removeItem("currentFocusTask");
-    if (e.type === "beforeunload") e.preventDefault(); // triggers native "Leave site?" dialog
+  // Prevent double-fire: beforeunload and pagehide both trigger on tab close
+  if (!_pageClosing) {
+    _pageClosing = true;
+    if (isFocusing) {
+      // Save focus record before leaving
+      const elapsed = Date.now() - focusStartTime;
+      saveFocusRecord(focusTaskName, focusCategory, elapsed, focusStartTime);
+      localStorage.removeItem("currentFocusTask");
+    }
+    socket.emit("intentionalClose");
+    recFrames = [];
   }
-  if (isRecording || recProcessing) {
-    if (e.type === "beforeunload") e.preventDefault(); // warn: recording in progress
+  if (e.type === "beforeunload") {
+    if (isFocusing || isRecording || recProcessing) e.preventDefault();
   }
-  socket.emit("intentionalClose");
-  recFrames = [];
 }
 window.addEventListener("beforeunload", handlePageClose);
 window.addEventListener("pagehide", handlePageClose);
